@@ -60,7 +60,7 @@ struct UnionINodeInner {
     /// Whether uppper directory occludes lower directory
     opaque: bool,
     /// Merged directory entries.
-    cached_entries: BTreeMap<String, Option<Arc<dyn INode>>>,
+    cached_entries: BTreeMap<String, Option<Weak<UnionINode>>>,
 }
 
 /// A virtual INode of a path in a FS
@@ -177,7 +177,7 @@ impl UnionFS {
             }),
         });
         root_inode.inner.write().this = Arc::downgrade(&root_inode);
-        root_inode.init_entry(root_inode.clone());
+        root_inode.init_entries(Arc::downgrade(&root_inode));
         root_inode
     }
 
@@ -252,7 +252,7 @@ impl UnionINodeInner {
     fn merge_entries(
         inners: &[VirtualINode],
         opaque: bool,
-    ) -> Result<BTreeMap<String, Option<Arc<dyn INode>>>> {
+    ) -> Result<BTreeMap<String, Option<Weak<UnionINode>>>> {
         let mut entries = BTreeMap::new();
         // images
         if !opaque {
@@ -285,7 +285,7 @@ impl UnionINodeInner {
     }
 
     /// Get the merged directory entries, the upper INode must to be a directory
-    pub fn entries(&mut self) -> &mut BTreeMap<String, Option<Arc<dyn INode>>> {
+    pub fn entries(&mut self) -> &mut BTreeMap<String, Option<Weak<UnionINode>>> {
         let cache = &mut self.cached_entries;
         if cache.is_empty() {
             let entries = Self::merge_entries(&self.inners, self.opaque).unwrap();
@@ -454,10 +454,10 @@ impl FileSystem for UnionFS {
 
 impl UnionINode {
     /// Initialize the entries of directory
-    pub fn init_entry(&self, parent: Arc<UnionINode>) {
+    pub fn init_entries(&self, parent: Weak<UnionINode>) {
         let mut inner = self.inner.write();
         inner.entries().insert(String::from(".."), Some(parent));
-        let this = inner.this.upgrade().unwrap();
+        let this = inner.this.clone();
         inner.entries().insert(String::from("."), Some(this));
     }
 }
@@ -565,11 +565,11 @@ impl INode for UnionINode {
             self.fs.create_inode(inodes, path_with_mode, opaque)
         };
         if type_ == FileType::Dir {
-            new_inode.init_entry(inner.this.upgrade().unwrap());
+            new_inode.init_entries(inner.this.clone());
         }
         inner
             .entries()
-            .insert(String::from(name), Some(new_inode.clone()));
+            .insert(String::from(name), Some(Arc::downgrade(&new_inode)));
         Ok(new_inode)
     }
 
@@ -834,7 +834,9 @@ impl INode for UnionINode {
             return Err(FsError::EntryNotFound);
         }
         if let Some(inode) = inode_option.unwrap() {
-            return Ok(inode.clone());
+            if let Some(inode) = inode.upgrade() {
+                return Ok(inode.clone());
+            }
         }
         let new_inode = {
             let inodes: Vec<_> = inner.inners.iter().map(|x| x.find(name)).collect();
@@ -857,11 +859,11 @@ impl INode for UnionINode {
             self.fs.create_inode(inodes, path_with_mode, opaque)
         };
         if new_inode.metadata()?.type_ == FileType::Dir {
-            new_inode.init_entry(inner.this.upgrade().unwrap());
+            new_inode.init_entries(inner.this.clone());
         }
         inner
             .entries()
-            .insert(String::from(name), Some(new_inode.clone()));
+            .insert(String::from(name), Some(Arc::downgrade(&new_inode)));
         Ok(new_inode)
     }
 
