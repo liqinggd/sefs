@@ -1,8 +1,12 @@
 #![cfg_attr(not(any(test, feature = "std")), no_std)]
 #![deny(warnings)]
 
+#[macro_use]
 extern crate alloc;
 extern crate log;
+
+#[macro_use]
+extern crate lazy_static;
 
 use alloc::{
     collections::BTreeMap,
@@ -49,7 +53,7 @@ impl RamFS {
             this: Weak::default(),
             parent: Weak::default(),
             children: BTreeMap::new(),
-            content: Vec::new(),
+            content: Content::new(),
             extra: Metadata {
                 dev: 0,
                 inode: 0,
@@ -88,6 +92,198 @@ impl RamFS {
     }
 }
 
+const KB: usize = 1024;
+const CHUNK_LEN: usize = 4 * KB;
+// ZERO_CHUNK is used to initialize the holes in the file content.
+// It is fast to initialize a vector by extending it with the contents of an iterator.
+lazy_static! {
+    static ref ZERO_CHUNK: Vec<u8> = vec![0; CHUNK_LEN];
+}
+
+struct Content {
+    data: Vec<Option<Vec<u8>>>,
+}
+
+impl Content {
+    fn new() -> Self {
+        Self { data: Vec::new() }
+    }
+
+    fn len(&self) -> usize {
+        let cur_chunk_count = self.data.len();
+        if cur_chunk_count > 0 {
+            CHUNK_LEN * (cur_chunk_count - 1)
+                + self.data[cur_chunk_count - 1].as_ref().unwrap().len()
+        } else {
+            0
+        }
+    }
+
+    fn resize_zero(&mut self, new_len: usize) {
+        let cur_chunk_count = self.data.len();
+        let new_chunk_count = (new_len + CHUNK_LEN - 1) / CHUNK_LEN;
+        let new_chunk_len = {
+            let offset = new_len % CHUNK_LEN;
+            if offset > 0 {
+                offset
+            } else if new_len > 0 {
+                CHUNK_LEN
+            } else {
+                0
+            }
+        };
+
+        if new_chunk_count > cur_chunk_count {
+            // Expand the chunks
+            self.data.resize(new_chunk_count, None);
+            // The chunks between cur_chunk_idx(cur_chunk_count - 1) and
+            // new_chunk_idx(new_chunk_count - 1) are hole, we do not
+            // need to initialize the hole until write data into it, so
+            // the length of these chunks is zero.
+            // Subsequent reads of the data in the hole will return null bytes.
+            if cur_chunk_count > 0 {
+                // Resize current tail chunk, it MUST have been initialized
+                self.data[cur_chunk_count - 1]
+                    .as_mut()
+                    .unwrap()
+                    .resize(CHUNK_LEN, 0);
+            }
+            // Initialize the new tail chunk
+            self.data[new_chunk_count - 1] = Some(Self::new_empty_chunk_with_len(new_chunk_len));
+        } else {
+            // Truncate the number of chunks
+            self.data.truncate(new_chunk_count);
+            if new_chunk_count > 0 {
+                if self.data[new_chunk_count - 1].is_none() {
+                    // Chunk is a hole, initialize it
+                    self.data[new_chunk_count - 1] =
+                        Some(Self::new_empty_chunk_with_len(new_chunk_len));
+                } else {
+                    // Resize new tail chunk
+                    self.data[new_chunk_count - 1]
+                        .as_mut()
+                        .unwrap()
+                        .resize(new_chunk_len, 0);
+                }
+            }
+        }
+    }
+
+    fn copy_from_slice(&mut self, offset: usize, src: &[u8]) {
+        if src.is_empty() {
+            return;
+        }
+
+        if offset + src.len() > self.len() {
+            self.resize_zero(offset + src.len());
+        }
+        let chunk_idx = offset / CHUNK_LEN;
+        let chunk_offset = offset % CHUNK_LEN;
+        let rest_len_in_first_chunk = CHUNK_LEN - chunk_offset;
+        let first_chunk_len = rest_len_in_first_chunk.min(src.len());
+        if self.data[chunk_idx].is_none() {
+            // Chunk is a hole, initialize it from slice
+            self.data[chunk_idx] = Some(Self::new_chunk_from_slice_at_offset(
+                &src[..first_chunk_len],
+                chunk_offset,
+            ))
+        } else {
+            // Copy to the first chunk
+            let target = &mut self.data[chunk_idx].as_mut().unwrap()
+                [chunk_offset..chunk_offset + first_chunk_len];
+            let buf = &src[..first_chunk_len];
+            target.copy_from_slice(buf)
+        }
+        if rest_len_in_first_chunk < src.len() {
+            let mut rest_len = src.len() - rest_len_in_first_chunk;
+            let mut chunk_idx = chunk_idx + 1;
+            let mut offset = rest_len_in_first_chunk;
+            while rest_len > 0 {
+                let copy_len = rest_len.min(CHUNK_LEN);
+                if self.data[chunk_idx].is_none() {
+                    // Chunk is a hole, initialize it from slice
+                    self.data[chunk_idx] = Some(Self::new_chunk_from_slice_at_offset(
+                        &src[offset..offset + copy_len],
+                        0,
+                    ))
+                } else {
+                    let target = &mut self.data[chunk_idx].as_mut().unwrap()[..copy_len];
+                    let buf = &src[offset..offset + copy_len];
+                    target.copy_from_slice(buf);
+                }
+                offset += CHUNK_LEN;
+                chunk_idx += 1;
+                rest_len -= copy_len;
+            }
+        }
+    }
+
+    fn copy_to_slice(&self, offset: usize, target: &mut [u8]) -> usize {
+        let start = self.len().min(offset);
+        let len = {
+            let end = self.len().min(offset + target.len());
+            end - start
+        };
+        if len == 0 {
+            return 0;
+        }
+
+        let chunk_idx = start / CHUNK_LEN;
+        let chunk_offset = start % CHUNK_LEN;
+        let rest_len_in_first_chunk = CHUNK_LEN - chunk_offset;
+        let first_chunk_len = rest_len_in_first_chunk.min(len);
+        if self.data[chunk_idx].is_none() {
+            // Chunk is a hole, set null bytes
+            for item in target.iter_mut().take(first_chunk_len) {
+                *item = 0;
+            }
+        } else {
+            target[..first_chunk_len].copy_from_slice(
+                &self.data[chunk_idx].as_ref().unwrap()
+                    [chunk_offset..chunk_offset + first_chunk_len],
+            );
+        }
+
+        if rest_len_in_first_chunk < len {
+            let mut rest_len = len - rest_len_in_first_chunk;
+            let mut chunk_idx = chunk_idx + 1;
+            let mut offset = rest_len_in_first_chunk;
+            while rest_len > 0 {
+                let copy_len = rest_len.min(CHUNK_LEN);
+                if self.data[chunk_idx].is_none() {
+                    // Chunk is a hole, set null bytes
+                    for item in target.iter_mut().skip(offset).take(copy_len) {
+                        *item = 0;
+                    }
+                } else {
+                    target[offset..offset + copy_len]
+                        .copy_from_slice(&self.data[chunk_idx].as_ref().unwrap()[..copy_len]);
+                }
+                offset += CHUNK_LEN;
+                chunk_idx += 1;
+                rest_len -= copy_len;
+            }
+        }
+        len
+    }
+
+    fn new_empty_chunk_with_len(len: usize) -> Vec<u8> {
+        assert!(len <= CHUNK_LEN);
+        let mut vec = Vec::with_capacity(CHUNK_LEN);
+        vec.extend(&ZERO_CHUNK[..len]);
+        vec
+    }
+
+    fn new_chunk_from_slice_at_offset(src: &[u8], offset: usize) -> Vec<u8> {
+        assert!(src.len() <= CHUNK_LEN);
+        let mut vec = Vec::with_capacity(CHUNK_LEN);
+        vec.extend(&ZERO_CHUNK[..offset]);
+        vec.extend(src);
+        vec.extend(&ZERO_CHUNK[offset + src.len()..]);
+        vec
+    }
+}
+
 struct RamFSINode {
     /// Reference to parent INode
     parent: Weak<LockedINode>,
@@ -96,7 +292,7 @@ struct RamFSINode {
     /// Reference to children INodes
     children: BTreeMap<String, Arc<LockedINode>>,
     /// Content of the file
-    content: Vec<u8>,
+    content: Content,
     /// INode metadata
     extra: Metadata,
     /// Reference to FS
@@ -111,11 +307,8 @@ impl INode for LockedINode {
         if file.extra.type_ != FileType::File && file.extra.type_ != FileType::SymLink {
             return Err(FsError::NotFile);
         }
-        let start = file.content.len().min(offset);
-        let end = file.content.len().min(offset + buf.len());
-        let src = &file.content[start..end];
-        buf[0..src.len()].copy_from_slice(src);
-        Ok(src.len())
+        let len = file.content.copy_to_slice(offset, buf);
+        Ok(len)
     }
 
     fn write_at(&self, offset: usize, buf: &[u8]) -> Result<usize> {
@@ -124,11 +317,7 @@ impl INode for LockedINode {
             return Err(FsError::NotFile);
         }
         let content = &mut file.content;
-        if offset + buf.len() > content.len() {
-            content.resize(offset + buf.len(), 0);
-        }
-        let target = &mut content[offset..offset + buf.len()];
-        target.copy_from_slice(buf);
+        content.copy_from_slice(offset, buf);
         Ok(buf.len())
     }
 
@@ -175,7 +364,7 @@ impl INode for LockedINode {
         if file.extra.type_ != FileType::File && file.extra.type_ != FileType::SymLink {
             return Err(FsError::NotFile);
         }
-        file.content.resize(len, 0);
+        file.content.resize_zero(len);
         Ok(())
     }
 
@@ -200,7 +389,7 @@ impl INode for LockedINode {
             parent: Weak::clone(&file.this),
             this: Weak::default(),
             children: BTreeMap::new(),
-            content: Vec::new(),
+            content: Content::new(),
             extra: Metadata {
                 dev: 0,
                 inode: file.fs.upgrade().unwrap().alloc_inode_id(),
