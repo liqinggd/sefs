@@ -39,9 +39,13 @@ enum Cmd {
         /// Target SEFS image directory
         #[structopt(parse(from_os_str))]
         image: PathBuf,
-        /// Integrity-only mode
+        /// Protect the integrity of FS
         #[structopt(short, long)]
-        integrity_only: bool,
+        protect_integrity: bool,
+        /// 16-byte key for encryption,
+        /// format is: xx-xx-xx-xx-xx-xx-xx-xx-xx-xx-xx-xx-xx-xx-xx-xx
+        #[structopt(short, long)]
+        key: Option<String>,
     },
     /// Unzip data from given <image> to <dir>
     #[structopt(name = "unzip")]
@@ -52,9 +56,13 @@ enum Cmd {
         /// Target unzip directory
         #[structopt(parse(from_os_str))]
         dir: PathBuf,
-        /// Integrity-only mode
+        /// Protect the integrity of FS
         #[structopt(short, long)]
-        integrity_only: bool,
+        protect_integrity: bool,
+        /// 16-byte key for decryption,
+        /// format is: xx-xx-xx-xx-xx-xx-xx-xx-xx-xx-xx-xx-xx-xx-xx-xx
+        #[structopt(short, long)]
+        key: Option<String>,
     },
     /// Mount <image> overlayed with <container> to <dir>
     #[structopt(name = "mount")]
@@ -94,7 +102,11 @@ fn main() -> Result<(), Box<dyn Error>> {
             dir,
         } => {
             let image_fs = {
-                let device = sgx_dev::SgxStorage::new(enclave.geteid(), &image, true);
+                let device = sgx_dev::SgxStorage::new(
+                    enclave.geteid(),
+                    &image,
+                    sgx_dev::EncryptMode::IntegrityOnly,
+                );
                 sefs::SEFS::open(Box::new(device), &StdTimeProvider, &StdUuidProvider)?
             };
             let mnt_dir = dir.clone();
@@ -113,7 +125,11 @@ fn main() -> Result<(), Box<dyn Error>> {
             // Mount as an UnionFS
             if container.is_dir() {
                 let union_fs = {
-                    let device = sgx_dev::SgxStorage::new(enclave.geteid(), &container, false);
+                    let device = sgx_dev::SgxStorage::new(
+                        enclave.geteid(),
+                        &container,
+                        sgx_dev::EncryptMode::EncryptAutoKey,
+                    );
                     let container_fs =
                         sefs::SEFS::open(Box::new(device), &StdTimeProvider, &StdUuidProvider)?;
                     unionfs::UnionFS::new(vec![container_fs, image_fs])?
@@ -127,26 +143,45 @@ fn main() -> Result<(), Box<dyn Error>> {
         Cmd::Zip {
             dir,
             image,
-            integrity_only,
+            protect_integrity,
+            key,
         } => {
             let sefs_fs = {
                 std::fs::create_dir(&image)?;
-                let device = sgx_dev::SgxStorage::new(enclave.geteid(), &image, integrity_only);
+                let mode = sgx_dev::EncryptMode::from_parameters(protect_integrity, key)?;
+                let device = sgx_dev::SgxStorage::new(enclave.geteid(), &image, mode);
                 sefs::SEFS::create(Box::new(device), &StdTimeProvider, &StdUuidProvider)?
             };
             zip_dir(&dir, sefs_fs.root_inode())?;
+            println!("Encrypt the SEFS image successfully");
+            if protect_integrity {
+                let root_mac_str = {
+                    let mut s = String::from("");
+                    for (i, byte) in sefs_fs.root_mac().iter().enumerate() {
+                        if i != 0 {
+                            s += "-";
+                        }
+                        s += &format!("{:02x}", byte);
+                    }
+                    s
+                };
+                println!("Root MAC: {}", root_mac_str);
+            }
         }
         Cmd::Unzip {
             image,
             dir,
-            integrity_only,
+            protect_integrity,
+            key,
         } => {
             let sefs_fs = {
-                let device = sgx_dev::SgxStorage::new(enclave.geteid(), &image, integrity_only);
+                let mode = sgx_dev::EncryptMode::from_parameters(protect_integrity, key)?;
+                let device = sgx_dev::SgxStorage::new(enclave.geteid(), &image, mode);
                 sefs::SEFS::open(Box::new(device), &StdTimeProvider, &StdUuidProvider)?
             };
             std::fs::create_dir(&dir)?;
             unzip_dir(&dir, sefs_fs.root_inode())?;
+            println!("Decrypt the SEFS image successfully");
         }
     }
     Ok(())
