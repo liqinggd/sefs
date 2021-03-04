@@ -207,7 +207,7 @@ impl vfs::INode for INodeImpl {
             let end = size.min(offset + buf.len());
             end - start
         };
-        let real_len = self.file.read_at(buf, offset)?;
+        let real_len = self.file.read_at(&mut buf[..len], offset)?;
         if real_len < len {
             for item in buf.iter_mut().skip(real_len).take(len - real_len) {
                 *item = 0;
@@ -220,6 +220,17 @@ impl vfs::INode for INodeImpl {
         let DiskINode { type_, size, .. } = **self.disk_inode.read();
         if type_ != FileType::File && type_ != FileType::SymLink {
             return Err(FsError::NotFile);
+        }
+        if offset > size as usize {
+            static ZEROS: [u8; 0x1000] = [0; 0x1000];
+            let mut rest_len = offset - size as usize;
+            let mut offset = size as usize;
+            while rest_len != 0 {
+                let l = rest_len.min(0x1000);
+                let len = self.file.write_at(&ZEROS[..l], offset)?;
+                rest_len -= len;
+                offset += len;
+            }
         }
         let len = self.file.write_at(buf, offset)?;
         let end_offset = offset + len;
