@@ -5,9 +5,15 @@ authors = ["Antfin"]
 build = "build.rs"
 edition = "2018"
 
+[features]
+default = [ "sgx_types", "sgx_urts" ]
+occlum = [ "sgx_types2", "sgx_urts2" ]
+
 [dependencies]
-sgx_types = "=1.1.0"
-sgx_urts = "=1.1.0"
+sgx_types = { version = "1.1", optional = true }
+sgx_types2 = { path = "../../../rust-sgx-sdk/sgx_types", package = "sgx_types", optional = true }
+sgx_urts = { version = "1.1", optional = true }
+sgx_urts2 = { path = "../../../rust-sgx-sdk/sgx_urts", package = "sgx_urts", optional = true }
 dirs = "1.0.2"
 fuse = "0.3"
 ctrlc = "3.1.6"

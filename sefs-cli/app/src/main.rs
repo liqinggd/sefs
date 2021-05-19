@@ -1,3 +1,8 @@
+#[cfg(feature = "occlum")]
+extern crate sgx_types2 as sgx_types;
+#[cfg(feature = "occlum")]
+extern crate sgx_urts2 as sgx_urts;
+
 use std::error::Error;
 use std::io::{Error as IoError, ErrorKind, Read};
 use std::os::unix::fs::FileExt;

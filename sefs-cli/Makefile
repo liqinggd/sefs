@@ -4,6 +4,7 @@ SGX_SDK ?= /opt/intel/sgxsdk
 SGX_MODE ?= HW
 SGX_ARCH ?= x64
 RUST_SGX_SDK ?= ../../rust-sgx-sdk
+WITH_OCCLUM ?= 0
 
 ifeq ($(shell getconf LONG_BIT), 32)
 	SGX_ARCH := x86
@@ -50,6 +51,11 @@ Enclave_EDL_Files := enclave/Enclave_t.c enclave/Enclave_t.h app/Enclave_u.c app
 ######## APP Settings ########
 
 App_Rust_Flags := --release
+
+ifeq ($(WITH_OCCLUM), 1)
+	App_Rust_Flags += --no-default-features --features occlum
+endif
+
 App_SRC_Files := $(shell find app/ -type f -name '*.rs') $(shell find app/ -type f -name 'Cargo.toml')
 App_Include_Paths := -I ./app -I./include -I$(SGX_SDK)/include -I$(CUSTOM_EDL_PATH)
 App_C_Flags := $(SGX_COMMON_CFLAGS) -fPIC -Wno-attributes $(App_Include_Paths)
